@@ -36,7 +36,10 @@
 using namespace Scintilla;
 #endif
 
-static bool IsSpaceEquiv(int state) {
+namespace {
+	// Use an unnamed namespace to protect the functions and classes from name conflicts
+
+bool IsSpaceEquiv(int state) {
 	return (state <= SCE_C_COMMENTDOC) ||
 		// including SCE_C_DEFAULT, SCE_C_COMMENT, SCE_C_COMMENTLINE
 		(state == SCE_C_COMMENTLINEDOC) || (state == SCE_C_COMMENTDOCKEYWORD) ||
@@ -50,7 +53,7 @@ static bool IsSpaceEquiv(int state) {
 // a = b+++/ptn/...
 // Putting a space between the '++' post-inc operator and the '+' binary op
 // fixes this, and is highly recommended for readability anyway.
-static bool FollowsPostfixOperator(StyleContext &sc, LexAccessor &styler) {
+bool FollowsPostfixOperator(StyleContext &sc, LexAccessor &styler) {
 	int pos = (int) sc.currentPos;
 	while (--pos > 0) {
 		char ch = styler[pos];
@@ -61,7 +64,7 @@ static bool FollowsPostfixOperator(StyleContext &sc, LexAccessor &styler) {
 	return false;
 }
 
-static bool followsReturnKeyword(StyleContext &sc, LexAccessor &styler) {
+bool followsReturnKeyword(StyleContext &sc, LexAccessor &styler) {
 	// Don't look at styles, so no need to flush.
 	int pos = (int) sc.currentPos;
 	int currentLine = styler.GetLine(pos);
@@ -83,7 +86,66 @@ static bool followsReturnKeyword(StyleContext &sc, LexAccessor &styler) {
 	return !*s;
 }
 
-static std::string GetRestOfLine(LexAccessor &styler, int start, bool allowSpace) {
+void highlightTaskMarker(StyleContext &sc, LexAccessor &styler,
+		int activity, WordList &markerList, bool caseSensitive){
+	if ((isoperator(sc.chPrev) || IsASpace(sc.chPrev)) && markerList.Length()) {
+		const int lengthMarker = 50;
+		char marker[lengthMarker+1];
+		int currPos = (int) sc.currentPos;
+		int i = 0;
+		while (i < lengthMarker) {
+			char ch = styler.SafeGetCharAt(currPos + i);
+			if (IsASpace(ch) || isoperator(ch)) {
+				break;
+			}
+			if (caseSensitive)
+				marker[i] = ch;
+			else
+				marker[i] = static_cast<char>(tolower(ch));
+			i++;
+		}
+		marker[i] = '\0';
+		if (markerList.InList(marker)) {
+			sc.SetState(SCE_C_TASKMARKER|activity);
+		}
+	}
+}
+
+struct EscapeSequence {
+	int digitsLeft;
+	CharacterSet setHexDigits;
+	CharacterSet setOctDigits;
+	CharacterSet setNoneNumeric;
+	CharacterSet *escapeSetValid;
+	EscapeSequence() {
+		digitsLeft = 0;
+		escapeSetValid = 0;
+		setHexDigits = CharacterSet(CharacterSet::setDigits, "ABCDEFabcdef");
+		setOctDigits = CharacterSet(CharacterSet::setNone, "01234567");
+	}
+	void resetEscapeState(int nextChar) {
+		digitsLeft = 0;
+		escapeSetValid = &setNoneNumeric;
+		if (nextChar == 'U') {
+			digitsLeft = 9;
+			escapeSetValid = &setHexDigits;
+		} else if (nextChar == 'u') {
+			digitsLeft = 5;
+			escapeSetValid = &setHexDigits;
+		} else if (nextChar == 'x') {
+			digitsLeft = 5;
+			escapeSetValid = &setHexDigits;
+		} else if (setOctDigits.Contains(nextChar)) {
+			digitsLeft = 3;
+			escapeSetValid = &setOctDigits;
+		}
+	}
+	bool atEscapeEnd(int currChar) const {
+		return (digitsLeft <= 0) || !escapeSetValid->Contains(currChar);
+	}
+};
+
+std::string GetRestOfLine(LexAccessor &styler, int start, bool allowSpace) {
 	std::string restOfLine;
 	int i =0;
 	char ch = styler.SafeGetCharAt(start, '\n');
@@ -100,14 +162,14 @@ static std::string GetRestOfLine(LexAccessor &styler, int start, bool allowSpace
 	return restOfLine;
 }
 
-static bool IsStreamCommentStyle(int style) {
+bool IsStreamCommentStyle(int style) {
 	return style == SCE_C_COMMENT ||
 		style == SCE_C_COMMENTDOC ||
 		style == SCE_C_COMMENTDOCKEYWORD ||
 		style == SCE_C_COMMENTDOCKEYWORDERROR;
 }
 
-static std::vector<std::string> Tokenize(const std::string &s) {
+std::vector<std::string> Tokenize(const std::string &s) {
 	// Break into space separated tokens
 	std::string word;
 	std::vector<std::string> tokens;
@@ -211,6 +273,8 @@ struct OptionsCPP {
 	bool updatePreprocessor;
 	bool triplequotedStrings;
 	bool hashquotedStrings;
+	bool backQuotedStrings;
+	bool escapeSequence;
 	bool fold;
 	bool foldSyntaxBased;
 	bool foldComment;
@@ -229,6 +293,8 @@ struct OptionsCPP {
 		updatePreprocessor = true;
 		triplequotedStrings = false;
 		hashquotedStrings = false;
+		backQuotedStrings = false;
+		escapeSequence = false;
 		fold = false;
 		foldSyntaxBased = true;
 		foldComment = false;
@@ -243,12 +309,13 @@ struct OptionsCPP {
 	}
 };
 
-static const char *const cppWordLists[] = {
+const char *const cppWordLists[] = {
             "Primary keywords and identifiers",
             "Secondary keywords and identifiers",
             "Documentation comment keywords",
             "Global classes and typedefs",
             "Preprocessor definitions",
+            "Task marker and error marker keywords",
             0,
 };
 
@@ -273,6 +340,12 @@ struct OptionSetCPP : public OptionSet<OptionsCPP> {
 
 		DefineProperty("lexer.cpp.hashquoted.strings", &OptionsCPP::hashquotedStrings,
 			"Set to 1 to enable highlighting of hash-quoted strings.");
+
+		DefineProperty("lexer.cpp.backquoted.strings", &OptionsCPP::backQuotedStrings,
+			"Set to 1 to enable highlighting of back-quoted raw strings .");
+
+		DefineProperty("lexer.cpp.escape.sequence", &OptionsCPP::escapeSequence,
+			"Set to 1 to enable highlighting of escape sequences in strings");
 
 		DefineProperty("fold", &OptionsCPP::fold);
 
@@ -312,7 +385,9 @@ struct OptionSetCPP : public OptionSet<OptionsCPP> {
 	}
 };
 
-static const char styleSubable[] = {SCE_C_IDENTIFIER, SCE_C_COMMENTDOCKEYWORD, 0};
+const char styleSubable[] = {SCE_C_IDENTIFIER, SCE_C_COMMENTDOCKEYWORD, 0};
+
+}
 
 class LexerCPP : public ILexerWithSubStyles {
 	bool caseSensitive;
@@ -328,9 +403,11 @@ class LexerCPP : public ILexerWithSubStyles {
 	WordList keywords3;
 	WordList keywords4;
 	WordList ppDefinitions;
+	WordList markerList;
 	std::map<std::string, std::string> preprocessorDefinitionsStart;
 	OptionsCPP options;
 	OptionSetCPP osCPP;
+	EscapeSequence escapeSeq;
 	SparseState<std::string> rawStringTerminators;
 	enum { activeFlag = 0x40 };
 	enum { ssIdentifier, ssDocKeyword };
@@ -452,6 +529,9 @@ int SCI_METHOD LexerCPP::WordListSet(int n, const char *wl) {
 	case 4:
 		wordListN = &ppDefinitions;
 		break;
+	case 5:
+		wordListN = &markerList;
+		break;
 	}
 	int firstModification = -1;
 	if (wordListN) {
@@ -511,6 +591,7 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 	int visibleChars = 0;
 	bool lastWordWasUUID = false;
 	int styleBeforeDCKeyword = SCE_C_DEFAULT;
+	int styleBeforeTaskMarker = SCE_C_DEFAULT;
 	bool continuationLine = false;
 	bool isIncludePreprocessor = false;
 	bool isStringInPreprocessor = false;
@@ -540,7 +621,7 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 		}
 	}
 
-	StyleContext sc(startPos, length, initStyle, styler, static_cast<char>(0xff));
+	StyleContext sc(startPos, length, initStyle, styler, static_cast<unsigned char>(0xff));
 	LinePPState preproc = vlls.ForLine(lineCurrent);
 
 	bool definitionsChanged = false;
@@ -725,6 +806,9 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 				if (sc.Match('*', '/')) {
 					sc.Forward();
 					sc.ForwardSetState(SCE_C_DEFAULT|activitySet);
+				} else {
+					styleBeforeTaskMarker = SCE_C_COMMENT;
+					highlightTaskMarker(sc, styler, activitySet, markerList, caseSensitive);
 				}
 				break;
 			case SCE_C_COMMENTDOC:
@@ -742,6 +826,9 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 			case SCE_C_COMMENTLINE:
 				if (sc.atLineStart && !continuationLine) {
 					sc.SetState(SCE_C_DEFAULT|activitySet);
+				} else {
+					styleBeforeTaskMarker = SCE_C_COMMENTLINE;
+					highlightTaskMarker(sc, styler, activitySet, markerList, caseSensitive);
 				}
 				break;
 			case SCE_C_COMMENTLINEDOC:
@@ -794,14 +881,34 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 						isIncludePreprocessor = false;
 					}
 				} else if (sc.ch == '\\') {
-					if (sc.chNext == '\"' || sc.chNext == '\'' || sc.chNext == '\\') {
-						sc.Forward();
+					if (options.escapeSequence) {
+						sc.SetState(SCE_C_ESCAPESEQUENCE|activitySet);
+						escapeSeq.resetEscapeState(sc.chNext);
 					}
+					sc.Forward(); // Skip all characters after the backslash
 				} else if (sc.ch == '\"') {
 					if (sc.chNext == '_') {
 						sc.ChangeState(SCE_C_USERLITERAL|activitySet);
 					} else {
 						sc.ForwardSetState(SCE_C_DEFAULT|activitySet);
+					}
+				}
+				break;
+			case SCE_C_ESCAPESEQUENCE:
+				escapeSeq.digitsLeft--;
+				if (!escapeSeq.atEscapeEnd(sc.ch)) {
+					break;
+				}
+				if (sc.ch == '"') {
+					sc.SetState(SCE_C_STRING|activitySet);
+					sc.ForwardSetState(SCE_C_DEFAULT|activitySet);
+				} else if (sc.ch == '\\') {
+					escapeSeq.resetEscapeState(sc.chNext);
+					sc.Forward();
+				} else {
+					sc.SetState(SCE_C_STRING|activitySet);
+					if (sc.atLineEnd) {
+						sc.ChangeState(SCE_C_STRINGEOL|activitySet);
 					}
 				}
 				break;
@@ -880,6 +987,12 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 				if (sc.atLineEnd || sc.ch == ')') {
 					sc.SetState(SCE_C_DEFAULT|activitySet);
 				}
+				break;
+			case SCE_C_TASKMARKER:
+				if (isoperator(sc.ch) || IsASpace(sc.ch)) {
+					sc.SetState(styleBeforeTaskMarker|activitySet);
+					styleBeforeTaskMarker = SCE_C_DEFAULT;
+				}
 		}
 
 		if (sc.atLineEnd && !atLineEndBeforeSwitch) {
@@ -899,6 +1012,10 @@ void SCI_METHOD LexerCPP::Lex(unsigned int startPos, int length, int initStyle, 
 				sc.Forward(2);
 			} else if (options.hashquotedStrings && sc.Match('#', '\"')) {
 				sc.SetState(SCE_C_HASHQUOTEDSTRING|activitySet);
+				sc.Forward();
+			} else if (options.backQuotedStrings && sc.Match('`')) {
+				sc.SetState(SCE_C_STRINGRAW|activitySet);
+				rawStringTerminator = "`";
 				sc.Forward();
 			} else if (IsADigit(sc.ch) || (sc.ch == '.' && IsADigit(sc.chNext))) {
 				if (lastWordWasUUID) {

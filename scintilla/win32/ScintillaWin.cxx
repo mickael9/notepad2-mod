@@ -125,6 +125,8 @@ class ScintillaWin; 	// Forward declaration for COM interface subobjects
 
 typedef void VFunction(void);
 
+static HMODULE commctrl32 = 0;
+
 /**
  */
 class FormatEnumerator {
@@ -272,8 +274,6 @@ class ScintillaWin :
 	virtual bool GetScrollInfo(int nBar, LPSCROLLINFO lpsi);
 	void ChangeScrollPos(int barType, int pos);
 
-	void InsertPasteText(const char *text, int len, SelectionPosition selStart, bool isRectangular, bool isLine);
-
 public:
 	// Public for benefit of Scintilla_DirectFunction
 	virtual sptr_t WndProc(unsigned int iMessage, uptr_t wParam, sptr_t lParam);
@@ -383,7 +383,8 @@ void ScintillaWin::Initialise() {
 		TrackMouseEventFn = (TrackMouseEventSig)::GetProcAddress(user32, "TrackMouseEvent");
 	if (TrackMouseEventFn == NULL) {
 		// Windows 95 has an emulation in comctl32.dll:_TrackMouseEvent
-		HMODULE commctrl32 = ::LoadLibrary(TEXT("comctl32.dll"));
+		if (!commctrl32)
+			commctrl32 = ::LoadLibrary(TEXT("comctl32.dll"));
 		if (commctrl32 != NULL) {
 			TrackMouseEventFn = (TrackMouseEventSig)
 				::GetProcAddress(commctrl32, "_TrackMouseEvent");
@@ -1645,44 +1646,12 @@ public:
 	}
 };
 
-void ScintillaWin::InsertPasteText(const char *text, int len, SelectionPosition selStart, bool isRectangular, bool isLine) {
-	if (isRectangular) {
-		PasteRectangular(selStart, text, len);
-	} else {
-		std::string convertedText;
-		if (convertPastes) {
-			// Convert line endings of the paste into our local line-endings mode
-			convertedText = Document::TransformLineEnds(text, len, pdoc->eolMode);
-			len = static_cast<int>(convertedText.length());
-			text = convertedText.c_str();
-		}
-		if (isLine) {
-			int insertPos = pdoc->LineStart(pdoc->LineFromPosition(sel.MainCaret()));
-			pdoc->InsertString(insertPos, text, len);
-			// add the newline if necessary
-			if ((len > 0) && (text[len-1] != '\n' && text[len-1] != '\r')) {
-				const char *endline = StringFromEOLMode(pdoc->eolMode);
-				pdoc->InsertString(insertPos + len, endline, static_cast<int>(strlen(endline)));
-				len += static_cast<int>(strlen(endline));
-			}
-			if (sel.MainCaret() == insertPos) {
-				SetEmptySelection(sel.MainCaret() + len);
-			}
-		} else {
-			InsertPaste(selStart, text, len);
-		}
-	}
-}
-
 void ScintillaWin::Paste() {
 	if (!::OpenClipboard(MainHWND()))
 		return;
 	UndoGroup ug(pdoc);
-	bool isLine = SelectionEmpty() && (::IsClipboardFormatAvailable(cfLineSelect) != 0);
+	const bool isLine = SelectionEmpty() && (::IsClipboardFormatAvailable(cfLineSelect) != 0);
 	ClearSelection(multiPasteMode == SC_MULTIPASTE_EACH);
-	SelectionPosition selStart = sel.IsRectangular() ?
-		sel.Rectangular().Start() :
-		sel.Range(sel.Main()).Start();
 	bool isRectangular = (::IsClipboardFormatAvailable(cfColumnSelect) != 0);
 
 	if (!isRectangular) {
@@ -1693,6 +1662,7 @@ void ScintillaWin::Paste() {
 			memBorlandSelection.Unlock();
 		}
 	}
+	const PasteShape pasteShape = isRectangular ? pasteRectangular : (isLine ? pasteLine : pasteStream);
 
 	// Always use CF_UNICODETEXT if available
 	GlobalMemory memUSelection(::GetClipboardData(CF_UNICODETEXT));
@@ -1718,7 +1688,7 @@ void ScintillaWin::Paste() {
 					                      &putf[0], len + 1, NULL, NULL);
 			}
 
-			InsertPasteText(&putf[0], len, selStart, isRectangular, isLine);
+			InsertPasteShape(&putf[0], len, pasteShape);
 		}
 		memUSelection.Unlock();
 	} else {
@@ -1746,9 +1716,9 @@ void ScintillaWin::Paste() {
 						// CP_UTF8 not available on Windows 95, so use UTF8FromUTF16()
 					UTF8FromUTF16(&uptr[0], ulen, &putf[0], mlen);
 
-					InsertPasteText(&putf[0], mlen, selStart, isRectangular, isLine);
+					InsertPasteShape(&putf[0], mlen, pasteShape);
 				} else {
-					InsertPasteText(ptr, len, selStart, isRectangular, isLine);
+					InsertPasteShape(ptr, len, pasteShape);
 				}
 			}
 			memSelection.Unlock();
@@ -2531,12 +2501,6 @@ STDMETHODIMP ScintillaWin::Drop(LPDATAOBJECT pIDataSource, DWORD grfKeyState,
 			}
 		}
 
-		if (!data.empty() && convertPastes) {
-			// Convert line endings of the drop into our local line-endings mode
-			std::string convertedText = Document::TransformLineEnds(&data[0], data.size() - 1, pdoc->eolMode);
-			data.assign(convertedText.c_str(), convertedText.c_str()+convertedText.length()+1);
-		}
-
 		if (!SUCCEEDED(hr) || data.empty()) {
 			//Platform::DebugPrintf("Bad data format: 0x%x\n", hres);
 			return hr;
@@ -2872,6 +2836,10 @@ int Scintilla_RegisterClasses(void *hInstance) {
 // This function is externally visible so it can be called from container when building statically.
 int Scintilla_ReleaseResources() {
 	bool result = ScintillaWin::Unregister();
+	if (commctrl32) {
+		FreeLibrary(commctrl32);
+		commctrl32 = NULL;
+	}
 	Platform_Finalise();
 	return result;
 }
